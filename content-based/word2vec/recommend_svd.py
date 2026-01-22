@@ -1,0 +1,144 @@
+import sys
+import pandas as pd
+import numpy as np
+import pymysql
+import json
+from scipy.sparse.linalg import svds
+
+# --- KONFIGURASI DATABASE ---
+DB_CONFIG = {
+    'host': '127.0.0.1',
+    'user': 'root',
+    'password': '',
+    'db': 'snackjuara',
+    'charset': 'utf8mb4'
+}
+
+def get_db_connection():
+    """Membuka koneksi ke database."""
+    return pymysql.connect(**DB_CONFIG)
+
+def get_transaction_df(connection):
+    """Mengambil data transaksi dan mengubahnya menjadi DataFrame."""
+    query = """
+        SELECT o.user_id, oi.product_id
+        FROM orders o
+        JOIN order_items oi ON o.id = oi.order_id
+        WHERE o.status = 'paid' AND o.deleted_at IS NULL
+    """
+    return pd.read_sql(query, connection)
+
+def get_recommendations_for_cart(cart_product_ids, num_recommendations=5):
+    """
+    [MODE: item] - Logika Item-Based Collaborative Filtering (untuk keranjang).
+    Mencari produk yang mirip dengan yang ada di keranjang.
+    """
+    connection = get_db_connection()
+    try:
+        df = get_transaction_df(connection)
+        if df.empty:
+            return []
+
+        user_item_matrix = df.groupby(['user_id', 'product_id']).size().unstack(fill_value=0)
+        user_item_matrix[user_item_matrix > 0] = 1
+        
+        valid_cart_ids = [pid for pid in cart_product_ids if pid in user_item_matrix.columns]
+        if not valid_cart_ids:
+            return []
+
+        R = user_item_matrix.values
+        user_ratings_mean = np.mean(R, axis=1)
+        R_demeaned = R - user_ratings_mean.reshape(-1, 1)
+        
+        # k harus lebih kecil dari jumlah kolom/produk
+        k = min(20, R.shape[1] - 2)
+        if k <= 0: return []
+        
+        _, _, Vt = svds(R_demeaned, k=k)
+        
+        item_features = pd.DataFrame(Vt.T, index=user_item_matrix.columns)
+        recommendations = {}
+
+        for product_id in valid_cart_ids:
+            target_features = item_features.loc[product_id]
+            sim_scores = item_features.dot(target_features).sort_values(ascending=False)
+            for item_id, score in sim_scores.items():
+                if item_id not in cart_product_ids:
+                    recommendations.setdefault(item_id, 0)
+                    recommendations[item_id] += score
+        
+        sorted_recommendations = sorted(recommendations.items(), key=lambda x: x[1], reverse=True)
+        return [rec[0] for rec in sorted_recommendations[:num_recommendations]]
+
+    finally:
+        connection.close()
+
+
+def get_recommendations_for_user(target_user_id, num_recommendations=5):
+    """
+    [MODE: user] - Logika User-Based Collaborative Filtering (untuk dashboard).
+    Memprediksi produk yang akan disukai user berdasarkan histori user lain yang mirip.
+    """
+    connection = get_db_connection()
+    try:
+        df = get_transaction_df(connection)
+        if df.empty:
+            return []
+
+        user_item_matrix = df.groupby(['user_id', 'product_id']).size().unstack(fill_value=0)
+        user_id_map = {id_val: i for i, id_val in enumerate(user_item_matrix.index)}
+        
+        # Cek jika target_user_id ada di data transaksi
+        if target_user_id not in user_id_map:
+            return [] # Cold Start: User baru atau belum pernah belanja
+
+        R = user_item_matrix.values
+        user_ratings_mean = np.mean(R, axis=1)
+        R_demeaned = R - user_ratings_mean.reshape(-1, 1)
+
+        k = min(20, R.shape[1] - 2)
+        if k <= 0: return []
+        
+        U, sigma, Vt = svds(R_demeaned, k=k)
+        sigma_diag_matrix = np.diag(sigma)
+        
+        # Prediksi skor semua item untuk user target
+        target_user_index = user_id_map[target_user_id]
+        predicted_ratings = np.dot(np.dot(U[target_user_index, :], sigma_diag_matrix), Vt) + user_ratings_mean[target_user_index]
+        
+        predictions_df = pd.DataFrame(predicted_ratings, index=user_item_matrix.columns, columns=['predictions']).sort_values('predictions', ascending=False)
+        
+        # Filter produk yang sudah pernah dibeli user
+        user_history = user_item_matrix.iloc[target_user_index]
+        unpurchased_items = user_history[user_history == 0].index
+        
+        recommendations = predictions_df.loc[unpurchased_items]
+        
+        return recommendations.head(num_recommendations).index.tolist()
+
+    finally:
+        connection.close()
+
+
+if __name__ == "__main__":
+    try:
+        mode = sys.argv[1]
+        input_data = sys.argv[2]
+        
+        if mode == "item":
+            cart_ids = [int(id_str) for id_str in input_data.split(',')]
+            results = get_recommendations_for_cart(cart_ids)
+            print(json.dumps(results))
+        
+        elif mode == "user":
+            target_user_id = int(input_data)
+            results = get_recommendations_for_user(target_user_id)
+            print(json.dumps(results))
+            
+        else:
+            print(json.dumps({"error": "Invalid mode specified."}))
+
+    except (IndexError, ValueError) as e:
+        print(json.dumps({"error": f"Invalid arguments provided. Error: {e}"}))
+    except Exception as e:
+        print(json.dumps({"error": f"An unexpected error occurred: {e}"}))

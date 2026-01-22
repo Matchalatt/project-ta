@@ -1,0 +1,97 @@
+# File: recommend.py (Versi Word2Vec)
+import sys
+import pandas as pd
+import pymysql
+import json
+import numpy as np
+from gensim.models import Word2Vec
+from nltk.tokenize import word_tokenize
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Fungsi untuk mengubah teks menjadi rata-rata vektor Word2Vec
+def get_vector(text, model, vector_size):
+    tokens = word_tokenize(text.lower())
+    vectors = [model.wv[word] for word in tokens if word in model.wv]
+    if not vectors:
+        # Jika tidak ada kata dalam teks yang dikenali model, kembalikan vektor nol
+        return np.zeros(vector_size)
+    return np.mean(vectors, axis=0)
+
+def get_recommendations(product_id, num_recommendations=5):
+    # --- 1. Konfigurasi & Koneksi Database (SAMA SEPERTI SEBELUMNYA) ---
+    db_config = {
+        'host': '127.0.0.1',
+        'user': 'root',
+        'password': '',
+        'db': 'snackjuara',
+        'charset': 'utf8mb4'
+    }
+
+    df = pd.DataFrame()
+    try:
+        connection = pymysql.connect(**db_config)
+        query = "SELECT id, name, tags FROM products"
+        df = pd.read_sql(query, connection)
+    except Exception as e:
+        print(json.dumps({"error": f"Database connection failed: {e}"}))
+        return
+    finally:
+        if 'connection' in locals() and connection.open:
+            connection.close()
+
+    if df.empty:
+        print(json.dumps({"error": "No data returned from the database."}))
+        return
+        
+    # --- 2. Pra-pemrosesan Data (SAMA SEPERTI SEBELUMNYA) ---
+    df['tags'] = df['tags'].fillna('')
+
+    # --- 3. [BARU] Tokenisasi Teks untuk Training Model ---
+    # Model Word2Vec butuh input berupa daftar kalimat, dimana setiap kalimat adalah daftar kata
+    # Contoh: [['manis', 'wijen'], ['gurih', 'asin', 'renyah']]
+    tokenized_tags = [word_tokenize(tags.lower()) for tags in df['tags']]
+
+    # --- 4. [BARU] Training Model Word2Vec ---
+    # vector_size: Jumlah dimensi untuk merepresentasikan satu kata (100-300 umum digunakan)
+    # window: Jarak maksimum antara kata target dan kata di sekitarnya
+    # min_count: Mengabaikan semua kata dengan frekuensi total lebih rendah dari ini
+    # workers: Jumlah thread yang digunakan untuk melatih model
+    vector_size = 100
+    model = Word2Vec(sentences=tokenized_tags, vector_size=vector_size, window=5, min_count=1, workers=4)
+    model.train(tokenized_tags, total_examples=len(tokenized_tags), epochs=20) # Latih model
+
+    # --- 5. [BARU] Membuat Vektor untuk Setiap Produk ---
+    # Terapkan fungsi get_vector ke setiap baris di kolom 'tags'
+    product_vectors = df['tags'].apply(lambda x: get_vector(x, model, vector_size))
+    # Ubah series of arrays menjadi matriks numpy 2D
+    vector_matrix = np.vstack(product_vectors)
+
+    # --- 6. Kalkulasi Cosine Similarity (SAMA SEPERTI SEBELUMNYA) ---
+    # Namun sekarang kita menggunakan matriks vektor dari Word2Vec
+    cosine_sim = cosine_similarity(vector_matrix, vector_matrix)
+
+    # --- 7. Dapatkan Rekomendasi (SAMA SEPERTI SEBELUMNYA) ---
+    try:
+        idx = df.index[df['id'] == product_id].tolist()[0]
+    except IndexError:
+        print(json.dumps({"error": "Product ID not found in DataFrame."}))
+        return
+
+    sim_scores = list(enumerate(cosine_sim[idx]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+    sim_scores = sim_scores[1:num_recommendations+1]
+    product_indices = [i[0] for i in sim_scores]
+    recommended_product_ids = df['id'].iloc[product_indices].tolist()
+
+    # --- 8. Kembalikan Hasil dalam Format JSON (SAMA SEPERTI SEBELUMNYA) ---
+    print(json.dumps(recommended_product_ids))
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        try:
+            target_product_id = int(sys.argv[1])
+            get_recommendations(target_product_id)
+        except ValueError:
+            print(json.dumps({"error": "Invalid Product ID provided."}))
+    else:
+        print(json.dumps({"error": "No Product ID provided."}))
