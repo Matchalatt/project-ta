@@ -11,14 +11,13 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# --- 1. Import Recommendation Functions (Collaborative Only) ---
+# --- 1. Import Recommendation Functions (k-NN Only) ---
 try:
-    from recommend_svd import get_recommendations_for_user as get_svd_recs
     from recommend_knn import get_recommendations_for_user as get_knn_recs
-    print("Successfully imported recommendation functions.")
+    print("Successfully imported k-NN recommendation function.")
 except ImportError as e:
     print(f"Failed to import modules: {e}")
-    print("Ensure recommend_svd.py and recommend_knn.py are in the same directory.")
+    print("Ensure recommend_knn.py is in the same directory.")
     exit()
 
 # --- 2. Database Configuration & Data Loading ---
@@ -56,15 +55,15 @@ df = get_transaction_df()
 
 if not df.empty:
     # --- Train-Test Split (same as evaluation) ---
-    train_df = df.sample(frac=0.8, random_state=42)
+    train_df = df.sample(frac=0.7, random_state=42)
     test_df = df.drop(train_df.index)
     test_ground_truth = test_df.groupby('user_id')['product_id'].apply(list).to_dict()
     print(f"Data split into: {len(train_df)} train, {len(test_df)} test rows.")
 
     # --- Create User-Item Matrix (using training data) ---
-    # We use the training data matrix as this is what models learn from
+    # We use the training data matrix as this is what the model learns from
     user_item_matrix_train = train_df.groupby(['user_id', 'product_id']).size().unstack(fill_value=0)
-    # Convert to binary (purchased or not) as done in KNN
+    # Convert to binary (purchased or not) as done in k-NN
     user_item_matrix_train[user_item_matrix_train > 0] = 1
     print(f"Train User-Item Matrix shape: {user_item_matrix_train.shape}")
 
@@ -72,7 +71,7 @@ if not df.empty:
     sparsity = 1.0 - (np.count_nonzero(user_item_matrix_train) / user_item_matrix_train.size)
     print(f"User-Item Matrix Sparsity: {sparsity:.4f} ({sparsity*100:.2f}%)")
     if sparsity > 0.95:
-        print("-> The matrix is very sparse. This can sometimes favor k-NN as finding direct neighbors might be more reliable than factorizing a sparse matrix for SVD.")
+        print("-> The matrix is very sparse. k-NN will rely heavily on finding the few overlapping users.")
     else:
         print("-> The matrix sparsity is moderate to low.")
 
@@ -91,7 +90,7 @@ if not df.empty:
     print("\n-> Product popularity distribution saved to 'product_popularity_distribution.png'")
     print(f"   - Most popular product ID: {product_popularity.index[0]} (Purchased {product_popularity.iloc[0]} times)")
     print(f"   - Least popular product count: { (product_popularity == product_popularity.min()).sum()} products purchased only {product_popularity.min()} time(s)")
-    print("   - Observe if there's a 'long tail' (many unpopular items). k-NN might focus more on popular items.")
+    print("   - Observe if there's a 'long tail'. k-NN tends to recommend popular items if neighbors are not very distinct.")
 
 
     # --- c) User Activity Analysis (using full dataset for context) ---
@@ -108,10 +107,10 @@ if not df.empty:
     print("\n-> User activity distribution saved to 'user_activity_distribution.png'")
     print(f"   - Most active user ID: {user_activity.idxmax()} (Purchased {user_activity.max()} unique products)")
     print(f"   - Least active user count: {(user_activity == user_activity.min()).sum()} users purchased only {user_activity.min()} unique product(s)")
-    print("   - Observe the range. If many users have few interactions, finding similar neighbors (k-NN) might be difficult, but SVD might still generalize. If users have moderate interactions, k-NN might work well.")
+    print("   - High user activity usually improves k-NN accuracy as there are more connections to find neighbors.")
 
-    # --- 4. Model Behavior Comparison (Qualitative on Sample Users) ---
-    print("\n--- Comparing Model Recommendations for Sample Users ---")
+    # --- 4. Model Behavior Analysis (Qualitative on Sample Users - k-NN Only) ---
+    print("\n--- Analyzing k-NN Recommendations for Sample Users ---")
     K = 5 # Number of recommendations
     sample_user_ids = list(test_ground_truth.keys())[:5] # Take first 5 users from test set
 
@@ -122,22 +121,16 @@ if not df.empty:
 
         # Get recommendations using the training data
         knn_recs = get_knn_recs(user_id, train_df, num_recommendations=K)
-        svd_recs = get_svd_recs(user_id, train_df, num_recommendations=K)
-
+        
         knn_hits = set(knn_recs) & relevant_items
-        svd_hits = set(svd_recs) & relevant_items
 
         print(f"  k-NN Recommendations: {knn_recs}")
         print(f"    -> Hits: {list(knn_hits)} ({len(knn_hits)}/{len(relevant_items)} relevant items found)")
 
-        print(f"  SVD Recommendations:  {svd_recs}")
-        print(f"    -> Hits: {list(svd_hits)} ({len(svd_hits)}/{len(relevant_items)} relevant items found)")
-
         # Optional: Check popularity of recommended items
         knn_pop_scores = [product_popularity.get(pid, 0) for pid in knn_recs]
-        svd_pop_scores = [product_popularity.get(pid, 0) for pid in svd_recs]
-        if knn_pop_scores and svd_pop_scores:
-             print(f"    -> Avg Popularity (k-NN): {np.mean(knn_pop_scores):.1f} | (SVD): {np.mean(svd_pop_scores):.1f}")
+        if knn_pop_scores:
+             print(f"    -> Avg Popularity of Recommended Items: {np.mean(knn_pop_scores):.1f}")
 
 
     print("\n--- Analysis Complete ---")

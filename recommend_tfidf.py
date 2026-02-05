@@ -2,130 +2,142 @@ import sys
 import pandas as pd
 import pymysql
 import json
+import warnings
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import matplotlib.pyplot as plt
-import seaborn as sns
-import warnings
 
-# Mengabaikan UserWarning dari pandas terkait SQLAlchemy agar output lebih bersih
-warnings.filterwarnings("ignore", category=UserWarning, module='pandas')
+# Mengabaikan warning agar output di terminal bersih
+warnings.filterwarnings("ignore")
 
-def visualize_matrix(matrix, labels, title='Cosine Similarity Matrix'):
-    """Membuat dan menyimpan heatmap dari matriks kemiripan."""
-    # Batasi jumlah label jika terlalu banyak agar visualisasi tidak terlalu padat
-    if len(labels) > 50:
-        sys.stderr.write("\n[Info] Jumlah produk > 50, heatmap tidak akan ditampilkan.\n")
-        return
+# =====================================================================
+# 1. KONFIGURASI DATABASE
+# =====================================================================
+DB_CONFIG = {
+    'host': '127.0.0.1', 
+    'user': 'root', 
+    'password': '',
+    'db': 'snackjuara', 
+    'charset': 'utf8mb4'
+}
 
-    plt.figure(figsize=(15, 12))
-    sns.heatmap(matrix, annot=False, cmap='viridis', xticklabels=labels, yticklabels=labels)
-    plt.title(title, fontsize=16)
-    plt.xticks(rotation=90, fontsize=8)
-    plt.yticks(rotation=0, fontsize=8)
-    plt.tight_layout()
-    
-    filename = f"{title.replace(' ', '_').lower()}.png"
-    plt.savefig(filename)
-    sys.stderr.write(f"\nHeatmap telah disimpan ke file '{filename}'\n")
+# =====================================================================
+# 2. CLASS: CONTENT BASED RECOMMENDER (OPTIMIZED)
+# =====================================================================
+class ContentRecommender:
+    def __init__(self):
+        self.df = pd.DataFrame()
+        self.cosine_sim = None
+        self.indices = None
+        # Otomatis memuat data saat object dibuat
+        self._load_and_process_data()
 
-def get_recommendations(product_id, num_recommendations=5, verbose=True):
-    """
-    Menghasilkan rekomendasi produk berdasarkan kemiripan konten (TF-IDF).
+    def _load_and_process_data(self):
+        """
+        Memuat data dari database dan membangun matriks TF-IDF & Cosine Similarity.
+        Dijalankan hanya SATU KALI untuk menghemat waktu.
+        """
+        connection = None
+        try:
+            connection = pymysql.connect(**DB_CONFIG)
+            query = "SELECT id, name, tags FROM products"
+            self.df = pd.read_sql(query, connection)
+            
+            if self.df.empty:
+                return
 
-    Args:
-        product_id (int): ID dari produk yang menjadi acuan.
-        num_recommendations (int): Jumlah rekomendasi yang diinginkan.
-        verbose (bool): Jika True, akan mencetak detail analisis dan membuat heatmap.
+            # --- Preprocessing ---
+            # Mengisi nilai null dengan string kosong
+            self.df['tags'] = self.df['tags'].fillna('').astype(str)
+            
+            # --- TF-IDF Vectorization ---
+            # stop_words='english' bisa dihapus jika produkmu dominan bahasa Indonesia
+            tfidf = TfidfVectorizer(stop_words='english') 
+            tfidf_matrix = tfidf.fit_transform(self.df['tags'])
+            
+            # --- Cosine Similarity ---
+            # Menggunakan cosine_similarity sesuai laporan skripsi
+            self.cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
+            
+            # --- Indexing ---
+            # Membuat mapping dari ID Produk ke Index DataFrame untuk pencarian cepat
+            self.indices = pd.Series(self.df.index, index=self.df['id']).drop_duplicates()
+            
+        except Exception as e:
+            # Print error ke stderr agar tidak merusak format JSON di stdout
+            sys.stderr.write(f"[ERROR] Init ContentRecommender: {e}\n")
+        finally:
+            if connection and connection.open:
+                connection.close()
 
-    Returns:
-        list: Daftar ID produk yang direkomendasikan.
-              Mengembalikan None jika terjadi error.
-    """
-    # --- 1. Konfigurasi & Koneksi Database ---
-    db_config = {
-        'host': '127.0.0.1',
-        'user': 'root',
-        'password': '',
-        'db': 'snackjuara',
-        'charset': 'utf8mb4'
-    }
+    def get_recs(self, product_id, k=5):
+        """
+        Fungsi utama untuk mendapatkan rekomendasi.
+        """
+        # Cek validitas data
+        if self.cosine_sim is None or product_id not in self.indices:
+            return []
 
-    try:
-        connection = pymysql.connect(**db_config)
-        query = "SELECT id, name, tags FROM products"
-        df = pd.read_sql(query, connection)
-    except Exception as e:
-        if verbose:
-            print(json.dumps({"error": f"Database connection failed: {e}"}))
-        return None
-    finally:
-        if 'connection' in locals() and connection.open:
-            connection.close()
+        # Ambil index dataframe dari product_id yang diminta
+        idx = self.indices[product_id]
 
-    if df.empty:
-        if verbose:
-            print(json.dumps({"error": "No data returned from the database."}))
-        return None
+        # Ambil skor similaritas dari matriks
+        # list(enumerate(...)) menghasilkan pasangan (index_produk, skor)
+        sim_scores = list(enumerate(self.cosine_sim[idx]))
+
+        # Urutkan berdasarkan skor tertinggi (descending)
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+
+        # Ambil top K rekomendasi
+        # Mulai dari index 1 karena index 0 adalah produk itu sendiri (skor 1.0)
+        sim_scores = sim_scores[1:k+1]
+
+        # Ambil Product ID dari hasil index tadi
+        product_indices = [i[0] for i in sim_scores]
         
-    # --- 2. Pra-pemrosesan Data ---
-    df['tags'] = df['tags'].fillna('')
+        # Kembalikan dalam bentuk List ID
+        return self.df['id'].iloc[product_indices].tolist()
 
-    # --- 3. Kalkulasi TF-IDF & Cosine Similarity ---
-    tfidf = TfidfVectorizer()
-    tfidf_matrix = tfidf.fit_transform(df['tags'])
-    cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
+# =====================================================================
+# 3. GLOBAL INSTANCE & WRAPPER FUNCTION
+# =====================================================================
+
+# Variabel global untuk menyimpan instance model agar tidak diload ulang
+_recommender_instance = None
+
+def get_recommendations(product_id, num_recommendations=5, verbose=False):
+    """
+    Wrapper function yang bisa dipanggil dari file lain.
+    Menggunakan pola Singleton untuk efisiensi.
+    """
+    global _recommender_instance
     
-    # --- 4. Dapatkan Indeks Produk Target ---
-    try:
-        idx = df.index[df['id'] == product_id].tolist()[0]
-    except IndexError:
-        if verbose:
-            print(json.dumps({"error": "Product ID not found in DataFrame."}))
-        return None
-
-    # --- 5. Visualisasi & Analisis (Jika verbose=True) ---
-    if verbose:
-        visualize_matrix(cosine_sim, df['name'].tolist(), title='Heatmap Kemiripan Produk (TF-IDF)')
-        
-        sys.stderr.write("\n--- HASIL ANALISIS TF-IDF ---\n")
-        target_name = df.iloc[idx]['name']
-        sys.stderr.write(f"Produk Target: {target_name} (ID: {product_id})\n")
-        sys.stderr.write(f"Bentuk Matriks Cosine Sim: {cosine_sim.shape}\n")
-        sys.stderr.write("\nTop 5 Skor Kemiripan:\n")
-
-    # --- 6. Urutkan dan Ambil Rekomendasi Teratas ---
-    sim_scores = list(enumerate(cosine_sim[idx]))
-    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-    top_scores = sim_scores[1:num_recommendations+1]
+    # Cek apakah instance sudah ada? Jika belum, buat baru.
+    # Jika sudah ada, langsung pakai yang lama (CACHE HIT).
+    if _recommender_instance is None:
+        _recommender_instance = ContentRecommender()
     
-    if verbose:
-        for i, score in top_scores:
-            product_name = df.iloc[i]['name']
-            sys.stderr.write(f"  - Produk: {product_name:<20} | Skor: {score:.4f}\n")
-        sys.stderr.write("--------------------------------\n")
+    return _recommender_instance.get_recs(product_id, k=num_recommendations)
 
-    # --- 7. Kembalikan Hasil ---
-    product_indices = [i[0] for i in top_scores]
-    recommended_product_ids = df['id'].iloc[product_indices].tolist()
-    
-    return recommended_product_ids
-
-
+# =====================================================================
+# 4. MAIN ENTRY POINT (CLI SUPPORT)
+# =====================================================================
 if __name__ == "__main__":
-    # Blok ini hanya akan berjalan jika file dieksekusi secara langsung
-    # dari command line, contoh: python recommend_tfidf.py 15
+    # Blok ini dijalankan jika script dipanggil via terminal/PHP/Laravel
+    # Contoh: python recommend_tfidf.py 15
     if len(sys.argv) > 1:
         try:
-            target_product_id = int(sys.argv[1])
-            # Panggil fungsi dengan mode verbose=True (default)
-            recommendations = get_recommendations(target_product_id)
-            
-            # Jika fungsi berhasil, cetak hasilnya sebagai JSON
-            if recommendations is not None:
-                print(json.dumps(recommendations))
-                
+            pid = int(sys.argv[1])
+            # Panggil fungsi rekomendasi
+            res = get_recommendations(pid)
+            # Output JSON murni untuk ditangkap aplikasi lain
+            print(json.dumps(res))
         except ValueError:
-            print(json.dumps({"error": "Invalid Product ID provided."}))
+            # Jika input bukan angka
+            print(json.dumps([]))
+        except Exception as e:
+            # Error lain
+            sys.stderr.write(f"Error: {e}")
+            print(json.dumps([]))
     else:
-        print(json.dumps({"error": "No Product ID provided."}))
+        # Jika dipanggil tanpa argumen
+        print(json.dumps([]))
